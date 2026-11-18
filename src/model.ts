@@ -1,6 +1,5 @@
 /** LanguageModel — a text LLM in the browser. */
 
-import { Template } from "@huggingface/jinja";
 import { detectCapabilities, huggingFaceResolver, loadModel, type LoadOptions, type ModelBundle, type ModelResolver, type ModelSession } from "@youni/onnxweb-core";
 import { ConfigurationError, GenerationError, ModelNotFoundError, Tokenizer, defaultLogger, type Logger, type TensorFactory } from "@youni/onnxweb-core/core";
 
@@ -9,6 +8,7 @@ import {
   CACHE_VERSION,
   CacheMismatchError,
   buildCacheExport,
+  checkCacheExport,
   deserializeCache,
   identityMismatch,
   readCacheExport,
@@ -21,6 +21,7 @@ import {
 import { DEFAULT_LLM, VARIANT_COMPUTE_TYPE, entryFor, kvBytesPerToken, type LlmEntry, type LlmVariant } from "./catalogue.js";
 import { Sampler, type SamplingSettings } from "./sampling.js";
 import { DecoderSession } from "./session.js";
+import { ChatTemplate } from "./template.js";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool" | string;
@@ -113,7 +114,7 @@ const THINK = /^\s*<think>([\s\S]*?)<\/think>\s*/;
 
 export class LanguageModel {
   readonly #logger: Logger;
-  #template: Template | null;
+  #template: ChatTemplate | null;
   /** The last conversation and the prompt it rendered to, for `exportContext()`. */
   #messages: ChatMessage[] = [];
   #text = "";
@@ -131,7 +132,8 @@ export class LanguageModel {
     logger: Logger,
   ) {
     this.#logger = logger;
-    this.#template = template ? new Template(template) : null;
+
+    this.#template = template ? new ChatTemplate(template) : null;
   }
 
   /** Resolve, download and load a model. */
@@ -468,10 +470,29 @@ export class LanguageModel {
   }
 
   /** Load the very model a cache was computed by, then the cache into it. */
-  static async loadForCache(cache: Uint8Array | ArrayBuffer | ExportedCache, options: Omit<LanguageModelOptions, "model" | "variant">): Promise<LanguageModel> {
+  static async loadForCache(
+    cache: Uint8Array | ArrayBuffer | ExportedCache,
+    options: Omit<LanguageModelOptions, "model" | "variant"> & { allowRepo?: (repo: string) => boolean },
+  ): Promise<LanguageModel> {
     const exported = cache instanceof Uint8Array || cache instanceof ArrayBuffer ? deserializeCache(cache) : cache;
+    checkCacheExport(exported);
     const { identity } = exported.header;
-    const model = await LanguageModel.load({ ...options, model: identity.repo ?? identity.model, variant: identity.variant as LlmVariant });
+    const { allowRepo, ...loadOptions } = options;
+    if (!(identity.variant in VARIANT_COMPUTE_TYPE)) throw new CacheMismatchError(`this cache names the variant '${identity.variant}', which no published model has`);
+    const found = entryFor(identity.model);
+    let name: string;
+    if (found && (identity.repo === null || identity.repo.toLowerCase() === found[1].repo.toLowerCase())) {
+      name = found[0];
+    } else {
+      const repo = identity.repo ?? identity.model;
+      if (!allowRepo?.(repo)) {
+        throw new CacheMismatchError(
+          `this cache was computed by ${repo}, which is not in the catalogue: it is not loaded unless the caller allows it (loadForCache's allowRepo)`,
+        );
+      }
+      name = repo;
+    }
+    const model = await LanguageModel.load({ ...loadOptions, model: name, variant: identity.variant as LlmVariant });
     try {
       model.importCache(exported);
     } catch (error) {

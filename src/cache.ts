@@ -228,8 +228,82 @@ export function buildCacheExport(
   return { header: { format: CACHE_FORMAT, version: CACHE_VERSION, identity, tokens: [...snapshot.tokens], tensors, createdAt: new Date().toISOString() }, body };
 }
 
-/** The tensors of an export, back in their model dtype. */
+/** The fields an identity has; every one must match for a cache to fit. */
+export const IDENTITY_FIELDS: readonly (keyof ModelIdentity)[] = ["model", "repo", "variant", "layers", "kvHeads", "headDim", "fingerprint"];
+
+const KINDS: ReadonlySet<string> = new Set(["key", "value", "conv", "recurrent"]);
+const DTYPE_BYTES: Readonly<Record<string, number>> = { float16: 2, float32: 4 };
+const QUANTIZATIONS: ReadonlySet<string> = new Set(["none", "int8"]);
+
+const bad = (message: string) => new ConfigurationError(`not a usable KV cache export: ${message}`);
+const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+/** The elements `dims` hold, or null when they are not counts (or their product passes 2^53). */
+function product(dims: readonly number[]): number | null {
+  let count = 1;
+  for (const d of dims) {
+    if (!isCount(d)) return null;
+    count *= d;
+    if (!Number.isSafeInteger(count)) return null;
+  }
+  return count;
+}
+
+function checkIdentity(identity: unknown): asserts identity is ModelIdentity {
+  if (!identity || typeof identity !== "object") throw bad("the header names no model");
+  const id = identity as Record<string, unknown>;
+  for (const field of ["model", "variant", "fingerprint"]) if (typeof id[field] !== "string") throw bad(`identity.${field} is not a string`);
+  if (id["repo"] !== null && typeof id["repo"] !== "string") throw bad("identity.repo is not a string");
+  for (const field of ["layers", "kvHeads", "headDim"]) if (!isCount(id[field])) throw bad(`identity.${field} is not a count`);
+}
+
+/**
+ * Every record of a header checked against the body it describes, before a byte of it is read: a
+ * `.ynkv` is a file people exchange, and its header says how many values to loop over (`dims`) and
+ * where to read them (`byteOffset`, `byteLength`). A 100-byte file declaring 10¹² values must be
+ * refused here, not dequantized.
+ */
+export function checkCacheExport(exported: ExportedCache): void {
+  const { header, body } = exported;
+  if (!header || typeof header !== "object") throw bad("no header");
+  checkIdentity(header.identity);
+  if (!Array.isArray(header.tokens) || !header.tokens.every((t) => isCount(t) && t < 2 ** 31)) throw bad("tokens are not token ids");
+  if (!Array.isArray(header.tensors)) throw bad("no tensor list");
+  const inside = (offset: unknown, length: unknown, what: string) => {
+    if (!isCount(offset) || !isCount(length) || offset + length > body.byteLength) throw bad(`${what} is not inside the body (${body.byteLength} bytes)`);
+  };
+  const seen = new Set<string>();
+  for (const record of header.tensors as unknown[]) {
+    if (!record || typeof record !== "object") throw bad("a tensor record is not an object");
+    const r = record as TensorRecord;
+    const part = typeof r.name === "string" ? partOf(r.name) : null;
+    if (!part || seen.has(r.name)) throw bad(`'${String(r.name)}' is not a cache input, or is listed twice`);
+    seen.add(r.name);
+    if (!KINDS.has(r.kind) || r.kind !== part.kind || r.layer !== part.layer) throw bad(`${r.name}: kind or layer does not match its name`);
+    const size = DTYPE_BYTES[r.dtype];
+    if (size === undefined) throw bad(`${r.name}: dtype '${String(r.dtype)}' (float16 or float32)`);
+    if (!QUANTIZATIONS.has(r.quantization)) throw bad(`${r.name}: quantization '${String(r.quantization)}'`);
+    const kv = r.kind === "key" || r.kind === "value";
+    if (!Array.isArray(r.dims) || (kv ? r.dims.length !== 4 : r.dims.length < 1 || r.dims.length > 8)) throw bad(`${r.name}: dims must be ${kv ? "4" : "1 to 8"} integers`);
+    const count = product(r.dims);
+    if (count === null) throw bad(`${r.name}: dims are not counts`);
+    inside(r.byteOffset, r.byteLength, `${r.name}'s data`);
+    if (r.quantization === "int8") {
+      if (!kv || (r.scaleAxis !== "channel" && r.scaleAxis !== "token")) throw bad(`${r.name}: int8 needs a key or value with a scale axis`);
+      const [batch, heads, steps, dim] = r.dims as [number, number, number, number];
+      const groups = r.scaleAxis === "channel" ? batch * heads * dim : batch * heads * steps;
+      if (r.byteLength !== count) throw bad(`${r.name}: ${r.byteLength} bytes for ${count} int8 values`);
+      inside(r.scaleOffset, r.scaleLength, `${r.name}'s scales`);
+      if (r.scaleLength !== groups * 4) throw bad(`${r.name}: ${String(r.scaleLength)} bytes of scales for ${groups} groups`);
+    } else if (r.byteLength !== count * size) {
+      throw bad(`${r.name}: ${r.byteLength} bytes for ${count} ${r.dtype} values`);
+    }
+  }
+}
+
+/** The tensors of an export, back in their model dtype (the export checked first). */
 export function readCacheExport(exported: ExportedCache): Map<string, { dims: number[]; type: string; data: KvData }> {
+  checkCacheExport(exported);
   const out = new Map<string, { dims: number[]; type: string; data: KvData }>();
   const { body } = exported;
   const slice = (offset: number, length: number) => body.buffer.slice(body.byteOffset + offset, body.byteOffset + offset + length);
@@ -259,16 +333,32 @@ export function serializeCache(exported: ExportedCache): Uint8Array {
   return out;
 }
 
+/**
+ * An export read back from its bytes, refused (`ConfigurationError`) unless every record fits its
+ * body.
+ */
 export function deserializeCache(bytes: Uint8Array | ArrayBuffer): ExportedCache {
   const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (view.byteLength < 4) throw bad(`${view.byteLength} bytes`);
   const length = new DataView(view.buffer, view.byteOffset, view.byteLength).getUint32(0, true);
-  const header = JSON.parse(new TextDecoder().decode(view.subarray(4, 4 + length))) as CacheHeader;
+  if (4 + length > view.byteLength) throw bad(`a header of ${length} bytes in a file of ${view.byteLength}`);
+  let header: CacheHeader;
+  try {
+    header = JSON.parse(new TextDecoder().decode(view.subarray(4, 4 + length))) as CacheHeader;
+  } catch (cause) {
+    throw new ConfigurationError("not a KV cache export (its header is not JSON)", { cause });
+  }
+  if (!header || typeof header !== "object") throw bad("its header is not an object");
   if (header.format !== CACHE_FORMAT) throw new ConfigurationError(`not a KV cache export (format '${String(header.format)}')`);
   if (header.version !== CACHE_VERSION) throw new ConfigurationError(`KV cache export version ${header.version}; this library reads ${CACHE_VERSION}`);
-  return { header, body: view.slice(align8(4 + length)) };
+  const exported = { header, body: view.slice(Math.min(align8(4 + length), view.byteLength)) };
+  checkCacheExport(exported);
+  return exported;
 }
 
 /** The fields on which two identities differ (empty when the cache fits). */
-export function identityMismatch(cache: ModelIdentity, model: ModelIdentity): string[] {
-  return (Object.keys(cache) as (keyof ModelIdentity)[]).filter((k) => cache[k] !== model[k]);
+export function identityMismatch(cache: ModelIdentity | null | undefined, model: ModelIdentity): string[] {
+  const fields = new Set<keyof ModelIdentity>([...IDENTITY_FIELDS, ...(Object.keys(model) as (keyof ModelIdentity)[])]);
+  const theirs = (cache && typeof cache === "object" ? cache : {}) as Partial<ModelIdentity>;
+  return [...fields].filter((k) => !(k in theirs) || theirs[k] !== model[k]);
 }
